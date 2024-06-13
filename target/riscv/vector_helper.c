@@ -188,6 +188,86 @@ GEN_VEXT_ST_ELEM(ste_h, uint16_t, H2, stw)
 GEN_VEXT_ST_ELEM(ste_w, uint32_t, H4, stl)
 GEN_VEXT_ST_ELEM(ste_d, uint64_t, H8, stq)
 
+static inline QEMU_ALWAYS_INLINE void
+vext_continus_ldst_tlb(CPURISCVState *env, vext_ldst_elem_fn_tlb *ldst_tlb,
+                       void *vd, uint32_t evl, target_ulong addr,
+                       uint32_t reg_start, uintptr_t ra, uint32_t esz,
+                       bool is_load)
+{
+    uint32_t i;
+    for (i = env->vstart; i < evl; env->vstart = ++i, addr += esz) {
+        ldst_tlb(env, adjust_addr(env, addr), i, vd, ra);
+    }
+}
+
+static inline QEMU_ALWAYS_INLINE void
+vext_continus_ldst_host(CPURISCVState *env, vext_ldst_elem_fn_host *ldst_host,
+                        void *vd, uint32_t evl, uint32_t reg_start, void *host,
+                        uint32_t esz, bool is_load)
+{
+#if HOST_BIG_ENDIAN
+    for (; reg_start < evl; reg_start++, host += esz) {
+        ldst_host(vd, reg_start, host);
+    }
+#else
+    if (esz == 1) {
+        uint32_t byte_offset = reg_start * esz;
+        uint32_t size = (evl - reg_start) * esz;
+
+        if (is_load) {
+            memcpy(vd + byte_offset, host, size);
+        } else {
+            memcpy(host, vd + byte_offset, size);
+        }
+    } else {
+        uint32_t byte_start = reg_start * esz;
+        uint32_t byte_end = evl * esz;
+        uint32_t byte_shift, reg_idx;
+        while (byte_start < byte_end) {
+            if (esz <= 8 && byte_start % 8 == 0 &&
+                (byte_start + 8) <= byte_end) {
+                reg_idx = byte_start / 8;
+                if (is_load) {
+                    lde_d_host(vd, reg_idx, host);
+                } else {
+                    ste_d_host(vd, reg_idx, host);
+                }
+                byte_shift = 8;
+            } else if (esz <= 4 && byte_start % 4 == 0 &&
+                       (byte_start + 4) <= byte_end) {
+                reg_idx = byte_start / 4;
+                if (is_load) {
+                    lde_w_host(vd, reg_idx, host);
+                } else {
+                    ste_w_host(vd, reg_idx, host);
+                }
+                byte_shift = 4;
+            } else if (esz <= 2 && byte_start % 2 == 0 &&
+                       (byte_start + 2) <= byte_end) {
+                reg_idx = byte_start / 2;
+                if (is_load) {
+                    lde_h_host(vd, reg_idx, host);
+                } else {
+                    ste_h_host(vd, reg_idx, host);
+                }
+                byte_shift = 2;
+            } else {
+                reg_idx = byte_start;
+                if (is_load) {
+                    lde_b_host(vd, reg_idx, host);
+                } else {
+                    ste_b_host(vd, reg_idx, host);
+                }
+                byte_shift = 1;
+            }
+
+            host += byte_shift;
+            byte_start += byte_shift;
+        }
+    }
+#endif
+}
+
 static void vext_set_tail_elems_1s(target_ulong vl, void *vd,
                                    uint32_t desc, uint32_t nf,
                                    uint32_t esz, uint32_t max_elems)
@@ -296,24 +376,34 @@ vext_page_ldst_us(CPURISCVState *env, void *vd, target_ulong addr,
                                mmu_index, true, &host, ra);
 
     if (flags == 0) {
-        for (i = env->vstart; i < evl; ++i) {
-            k = 0;
-            while (k < nf) {
-                ldst_host(vd, i + k * max_elems, host);
-                host += esz;
-                k++;
+        if (nf == 1) {
+            vext_continus_ldst_host(env, ldst_host, vd, evl, env->vstart, host,
+                                    esz, is_load);
+        } else {
+            for (i = env->vstart; i < evl; ++i) {
+                k = 0;
+                while (k < nf) {
+                    ldst_host(vd, i + k * max_elems, host);
+                    host += esz;
+                    k++;
+                }
             }
         }
         env->vstart += elems;
     } else {
-        /* load bytes from guest memory */
-        for (i = env->vstart; i < evl; env->vstart = ++i) {
-            k = 0;
-            while (k < nf) {
-                ldst_tlb(env, adjust_addr(env, addr), i + k * max_elems, vd,
-                         ra);
-                addr += esz;
-                k++;
+        if (nf == 1) {
+            vext_continus_ldst_tlb(env, ldst_tlb, vd, evl, addr, env->vstart,
+                                   ra, esz, is_load);
+        } else {
+            /* load bytes from guest memory */
+            for (i = env->vstart; i < evl; env->vstart = ++i) {
+                k = 0;
+                while (k < nf) {
+                    ldst_tlb(env, adjust_addr(env, addr), i + k * max_elems,
+                             vd, ra);
+                    addr += esz;
+                    k++;
+                }
             }
         }
     }
